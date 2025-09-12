@@ -1,4 +1,4 @@
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import re
 from dataclasses import dataclass, field
 
@@ -50,19 +50,28 @@ class StockNewsRecommender:
         return url_or_text
 
     @staticmethod
-    def _find_candidate_tickers(text: str) -> List[str]:
-        # Very naive ticker extraction. Filters out common English words by querying yfinance info.
+    def _find_candidate_tickers(text: str) -> Tuple[List[str], Dict[str, dict]]:
+        # Extract uppercase tokens and validate via yfinance fast_info once per symbol.
         matches = set(TICKER_REGEX.findall(text))
-        valid = []
+        valid: List[str] = []
+        ticker_info_map: Dict[str, dict] = {}
         for symbol in matches:
             try:
                 info = yf.Ticker(symbol).fast_info
-                # fast_info returns None if symbol invalid in many cases
                 if info and info.get("lastPrice") is not None:
                     valid.append(symbol)
+                    ticker_info_map[symbol] = info
             except Exception:
                 continue
-        return valid
+        return valid, ticker_info_map
+
+    @staticmethod
+    def _compile_ticker_search(tickers: List[str]) -> Optional[re.Pattern]:
+        if not tickers:
+            return None
+        # Compile a single regex to search all tickers as substrings (preserves original behavior)
+        pattern = "|".join(re.escape(t) for t in tickers)
+        return re.compile(pattern)
 
     def _segment_sentences(self, text: str) -> List[str]:
         # Split by period for simplicity. Advanced NLP could be added.
@@ -76,7 +85,7 @@ class StockNewsRecommender:
 
     def recommend(self, url_or_text: str, top_k: int = 5) -> List[StockSentiment]:
         text = self._extract_article_text(url_or_text)
-        tickers = self._find_candidate_tickers(text)
+        tickers, ticker_info_map = self._find_candidate_tickers(text)
         if not tickers:
             return []
 
@@ -85,24 +94,32 @@ class StockNewsRecommender:
 
         # Map sentiments to tickers
         ticker_scores = {t: [] for t in tickers}
+        pattern = self._compile_ticker_search(tickers)
         for _, row in predictions.iterrows():
             sentence = row["Text"]
-            contained = [t for t in tickers if t in sentence]
-            if not contained:
+            if not pattern:
                 continue
-            for t in contained:
+            matches = pattern.findall(sentence)
+            if not matches:
+                continue
+            for t in set(matches):
                 ticker_scores[t].append((row["Positive"], row["Negative"], row["Neutral"]))
 
         recommendations: List[StockSentiment] = []
         for t, vals in ticker_scores.items():
             if len(vals) < self.min_occurrences:
                 continue
-            arr = np.array(vals)
-            pos, neg, neu = arr[:, 0].mean(), arr[:, 1].mean(), arr[:, 2].mean()
+            count = len(vals)
+            pos = sum(v[0] for v in vals) / count
+            neg = sum(v[1] for v in vals) / count
+            neu = sum(v[2] for v in vals) / count
             if pos - neg < self.positive_threshold:
                 continue
+            price = None
             try:
-                price = yf.Ticker(t).fast_info.get("lastPrice")
+                price = ticker_info_map.get(t, {}).get("lastPrice")
+                if price is None:
+                    price = yf.Ticker(t).fast_info.get("lastPrice")
             except Exception:
                 price = None
             recommendations.append(StockSentiment(ticker=t, positive=pos, negative=neg, neutral=neu, current_price=price))
